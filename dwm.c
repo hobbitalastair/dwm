@@ -30,6 +30,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <proc/readproc.h>
+#include <linux/limits.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <X11/Xatom.h>
@@ -40,6 +42,8 @@
 #include <X11/extensions/Xinerama.h>
 #endif /* XINERAMA */
 #include <X11/Xft/Xft.h>
+#include <X11/Xlib-xcb.h>
+#include <xcb/res.h>
 
 #include "drw.h"
 #include "util.h"
@@ -149,6 +153,7 @@ static void arrangemon(Monitor *m);
 static void attach(Client *c);
 static void attachstack(Client *c);
 static void buttonpress(XEvent *e);
+static void changetochilddir(pid_t pid);
 static void checkotherwm(void);
 static void cleanup(void);
 static void cleanupmon(Monitor *mon);
@@ -165,10 +170,13 @@ static void drawbar(Monitor *m);
 static void drawbars(void);
 static void enternotify(XEvent *e);
 static void expose(XEvent *e);
+static int findchildproc(proc_t** proctab, int pid);
+static int findforegroundchildproc(proc_t** proctab, int pid);
 static void focus(Client *c);
 static void focusin(XEvent *e);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
+static void freeproctab(proc_t** proctab);
 static Atom getatomprop(Client *c, Atom prop);
 static int getrootptr(int *x, int *y);
 static long getstate(Window w);
@@ -227,6 +235,7 @@ static void updatetitle(Client *c);
 static void updatewindowtype(Client *c);
 static void updatewmhints(Client *c);
 static void view(const Arg *arg);
+static pid_t winpid(Window w);
 static Client *wintoclient(Window w);
 static Monitor *wintomon(Window w);
 static int xerror(Display *dpy, XErrorEvent *ee);
@@ -267,6 +276,7 @@ static Display *dpy;
 static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
+static xcb_connection_t *xcon;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -455,6 +465,35 @@ buttonpress(XEvent *e)
 		if (click == buttons[i].click && buttons[i].func && buttons[i].button == ev->button
 		&& CLEANMASK(buttons[i].mask) == CLEANMASK(ev->state))
 			buttons[i].func(click == ClkTagBar && buttons[i].arg.i == 0 ? &arg : &buttons[i].arg);
+}
+
+void changetochilddir(pid_t pid)
+{
+	proc_t** proctab = readproctab(PROC_FILLSTAT);
+	if (!proctab)
+		return;
+
+	// From the PID, try to find a likely child
+	int child = pid;
+	int parent = pid;
+        do {
+		parent = child;
+	        child = findforegroundchildproc(proctab, parent);
+		if (child == -1)
+			child = findchildproc(proctab, parent);
+	} while (child != -1);
+
+	freeproctab(proctab);
+
+	char cwd_file_path[100] = {0}; // should be big enough for /proc//cwd plus large integer
+	sprintf(cwd_file_path, "/proc/%d/cwd", parent);
+
+	char cwd[PATH_MAX] = {0};
+	size_t len = readlink(cwd_file_path, cwd, sizeof(cwd)-1);
+	if (len == -1)
+		return;
+
+	chdir(cwd);
 }
 
 void
@@ -786,6 +825,30 @@ expose(XEvent *e)
 		drawbar(m);
 }
 
+int
+findchildproc(proc_t** proctab, int pid)
+{
+	proc_t* proc = 0;
+	while ((proc = *proctab++)) {
+		if (proc->ppid == pid) {
+			return proc->tid;
+		}
+	}
+	return -1;
+}
+
+int
+findforegroundchildproc(proc_t** proctab, int pid)
+{
+	proc_t* proc = 0;
+	while ((proc = *proctab++)) {
+		if (proc->ppid == pid && proc->pgrp == proc->tpgid) {
+			return proc->tid;
+		}
+	}
+	return -1;
+}
+
 void
 focus(Client *c)
 {
@@ -858,6 +921,15 @@ focusstack(const Arg *arg)
 	if (c) {
 		focus(c);
 		restack(selmon);
+	}
+}
+
+void
+freeproctab(proc_t** proctab)
+{
+	proc_t* proc = 0;
+	while ((proc = *proctab++)) {
+		freeproc(proc);
 	}
 }
 
@@ -1649,10 +1721,17 @@ spawn(const Arg *arg)
 {
 	if (arg->v == dmenucmd)
 		dmenumon[0] = '0' + selmon->num;
+
+	pid_t selpid = 0;
+	if (selmon->sel) {
+		selpid = winpid(selmon->sel->win);
+	}
+
 	if (fork() == 0) {
 		if (dpy)
 			close(ConnectionNumber(dpy));
 		setsid();
+		changetochilddir(selpid);
 		execvp(((char **)arg->v)[0], (char **)arg->v);
 		die("dwm: execvp '%s' failed:", ((char **)arg->v)[0]);
 	}
@@ -2054,6 +2133,40 @@ view(const Arg *arg)
 	arrange(selmon);
 }
 
+pid_t
+winpid(Window w)
+{
+	pid_t result = 0;
+
+	xcb_res_client_id_spec_t spec = {0};
+	spec.client = w;
+	spec.mask = XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID;
+
+	xcb_generic_error_t *e = NULL;
+	xcb_res_query_client_ids_cookie_t c = xcb_res_query_client_ids(xcon, 1, &spec);
+	xcb_res_query_client_ids_reply_t *r = xcb_res_query_client_ids_reply(xcon, c, &e);
+
+	if (!r)
+		return (pid_t)0;
+
+	xcb_res_client_id_value_iterator_t i = xcb_res_query_client_ids_ids_iterator(r);
+	for (; i.rem; xcb_res_client_id_value_next(&i)) {
+		spec = i.data->spec;
+		if (spec.mask & XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID) {
+			uint32_t *t = xcb_res_client_id_value_value(i.data);
+			result = *t;
+			break;
+		}
+	}
+
+	free(r);
+
+	if (result == (pid_t)-1)
+		result = 0;
+
+	return result;
+}
+
 Client *
 wintoclient(Window w)
 {
@@ -2143,6 +2256,8 @@ main(int argc, char *argv[])
 		fputs("warning: no locale support\n", stderr);
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("dwm: cannot open display");
+        if (!(xcon = XGetXCBConnection(dpy)))
+                die("dwm: cannot get xcb connection");
 	checkotherwm();
 	setup();
 #ifdef __OpenBSD__
