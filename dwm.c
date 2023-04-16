@@ -1602,7 +1602,7 @@ setmfact(const Arg *arg)
 	if (!arg || !selmon->lt[selmon->sellt]->arrange)
 		return;
 	f = arg->f < 1.0 ? arg->f + selmon->mfact : arg->f - 1.0;
-	if (f < 0.05 || f > 0.95)
+	if (f < 0.05)
 		return;
 	selmon->mfact = f;
 	arrange(selmon);
@@ -1766,29 +1766,39 @@ tagmon(const Arg *arg)
 void
 tile(Monitor *m)
 {
-	unsigned int i, n, h, mw, my, ty;
+	unsigned int i, n, mw, width, next_x;
 	Client *c;
 
 	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++);
 	if (n == 0)
 		return;
 
-	if (n > m->nmaster)
-		mw = m->nmaster ? m->ww * m->mfact : 0;
-	else
-		mw = m->ww;
-	for (i = my = ty = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
-		if (i < m->nmaster) {
-			h = (m->wh - my) / (MIN(n, m->nmaster) - i);
-			resize(c, m->wx, m->wy + my, mw - (2*c->bw), h - (2*c->bw), 0);
-			if (my + HEIGHT(c) < m->wh)
-				my += HEIGHT(c);
+	// FIXME: Doesn't differentiate between clients before and clients after
+	//        the master, which the original implementation did?
+	if (m->nmaster) {
+		if (n == 1) {
+			mw = m->ww;
+			width = 0;
 		} else {
-			h = (m->wh - ty) / (n - i);
-			resize(c, m->wx + mw, m->wy + ty, m->ww - mw - (2*c->bw), h - (2*c->bw), 0);
-			if (ty + HEIGHT(c) < m->wh)
-				ty += HEIGHT(c);
+			mw = (m->ww / n) * m->mfact;
+	    	width = (m->ww - mw) / (MAX(n - 1, 1));
 		}
+	} else {
+		mw = 0;
+		width = m->ww / n;
+	}
+
+	for (i = next_x = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+    {
+		unsigned int window_width = width;
+		if (i == (m->nmaster - 1)) {
+			window_width = mw;
+		}
+
+        resize(c, m->wx + next_x, m->wy, window_width - (2*c->bw), m->wh - (2*c->bw), 0);
+        if (next_x + WIDTH(c) < m->wh)
+            next_x += WIDTH(c);
+    }
 }
 
 void
