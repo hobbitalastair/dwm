@@ -2270,3 +2270,5 @@ main(int argc, char *argv[])
 	XCloseDisplay(dpy);
 	return EXIT_SUCCESS;
 }
+
+// vim: noet ci pi sts=0 sw=4 ts=4
